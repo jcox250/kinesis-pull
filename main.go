@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/flexera/micro/log"
+	"github.com/jcox250/log"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -37,27 +37,22 @@ func init() {
 }
 
 func main() {
-	ctx := setupLogger(context.Background(), debug)
+	//ctx := setupLogger(context.Background(), debug)
+	logger := log.NewLeveledLogger(os.Stderr, debug)
 	kc, err := NewKinesisClient(KinesisConfig{
 		StreamName:        streamName,
 		RoleArn:           roleArn,
 		ShardIteratorType: shardIteratorType,
 		AWSRegion:         awsRegion,
 		Timestamp:         timestamp,
+		Logger:            logger,
 	})
 	if err != nil {
 		stdlog.Fatal(err)
 	}
 
+	ctx := context.Background()
 	kc.Sub(ctx)
-}
-
-func setupLogger(ctx context.Context, debug bool) context.Context {
-	ctx = log.New(ctx, log.NewSyncWriter(os.Stderr))
-	if debug {
-		ctx = log.EnableDebug(ctx, debug)
-	}
-	return ctx
 }
 
 type KinesisConfig struct {
@@ -67,9 +62,11 @@ type KinesisConfig struct {
 	AWSRegion         string
 	Shards            []string
 	Timestamp         string
+	Logger            log.LeveledLogger
 }
 
 type KinesisClient struct {
+	logger            log.LeveledLogger
 	client            *kinesis.Kinesis
 	streamName        string
 	shards            []string
@@ -82,6 +79,7 @@ func NewKinesisClient(k KinesisConfig) (*KinesisClient, error) {
 	creds := stscreds.NewCredentials(s, k.RoleArn)
 
 	kc := &KinesisClient{
+		logger:            k.Logger,
 		client:            kinesis.New(s, &aws.Config{Region: aws.String(k.AWSRegion), Credentials: creds}),
 		streamName:        k.StreamName,
 		shards:            k.Shards,
@@ -103,7 +101,7 @@ func NewKinesisClient(k KinesisConfig) (*KinesisClient, error) {
 func (k *KinesisClient) Sub(ctx context.Context) {
 	for _, shard := range k.shards {
 		if err := k.readShard(ctx, shard); err != nil {
-			log.Error(ctx, "msg", "failed to read shard", "shardID", shard, "err", err)
+			k.logger.Error("msg", "failed to read shard", "shardID", shard, "err", err)
 		}
 	}
 }
@@ -127,7 +125,7 @@ func (k *KinesisClient) readShard(ctx context.Context, shardID string) error {
 					continue
 				}
 			}
-			log.Error(ctx, "msg", "failed to get records for shard")
+			k.logger.Error("msg", "failed to get records for shard")
 			return err
 		}
 
@@ -143,11 +141,11 @@ func (k *KinesisClient) readShard(ctx context.Context, shardID string) error {
 		}
 
 		if out.MillisBehindLatest != nil {
-			log.Debug(ctx, "MillisBehindLatest", *out.MillisBehindLatest)
+			k.logger.Debug("MillisBehindLatest", *out.MillisBehindLatest)
 		}
 
 		if out.NextShardIterator == nil {
-			log.Error(ctx, "msg", "shard closed")
+			k.logger.Error("msg", "shard closed")
 			return nil
 		}
 		iterator = *out.NextShardIterator
