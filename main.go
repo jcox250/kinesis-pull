@@ -37,7 +37,6 @@ func init() {
 }
 
 func main() {
-	//ctx := setupLogger(context.Background(), debug)
 	logger := log.NewLeveledLogger(os.Stderr, debug)
 	kc, err := NewKinesisClient(KinesisConfig{
 		StreamName:        streamName,
