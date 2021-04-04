@@ -5,10 +5,13 @@ import (
 	"flag"
 	"fmt"
 	stdlog "log"
+	"net/http"
 	"os"
 	"time"
 
 	"github.com/jcox250/log"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -18,12 +21,30 @@ import (
 )
 
 var (
+	millisBehindLatest = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kinesis_millis_behind_latest",
+		Help: "Shows how many milliseconds behind the latest record",
+	},
+		[]string{"shard"},
+	)
+
+	writtenAt = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "kinesis_written_at",
+		Help: "Shows when the last record read from the shard was written",
+	},
+		[]string{"shard"},
+	)
+)
+
+var (
 	streamName        string
 	roleArn           string
 	shardIteratorType string
 	timestamp         string
 	awsRegion         string
+	kinesisEndpoint   string
 	debug             bool
+	metricsPort       int
 )
 
 func init() {
@@ -32,23 +53,35 @@ func init() {
 	flag.StringVar(&shardIteratorType, "shard-iterator-type", "", "shard iterator type e.g TRIM_HORIZON")
 	flag.StringVar(&timestamp, "timestamp", "", "timestamp to pass if you use AT_TIMESTAMP for the shard-iterator-type")
 	flag.StringVar(&awsRegion, "aws-region", "", "aws region e.g us-east-1")
+	flag.StringVar(&kinesisEndpoint, "kinesis-endpoint", "", "kinesis endpoint - used for local dev with localstack")
 	flag.BoolVar(&debug, "debug", false, "enables debug logs")
+	flag.IntVar(&metricsPort, "metrics-port", 9000, "port that metrics server uses")
 	flag.Parse()
+
+	prometheus.MustRegister(millisBehindLatest)
+	prometheus.MustRegister(writtenAt)
 }
 
 func main() {
 	logger := log.NewLeveledLogger(os.Stderr, debug)
+	logger.Info("msg", "kinesis config", "stream-name", streamName, "role-arn", roleArn, "shard-iterator-type", shardIteratorType, "timestamp", timestamp, "aws-region", awsRegion)
+	logger.Info("msg", "service config", "debug", debug, "metricsPort", metricsPort)
+
 	kc, err := NewKinesisClient(KinesisConfig{
 		StreamName:        streamName,
 		RoleArn:           roleArn,
 		ShardIteratorType: shardIteratorType,
 		AWSRegion:         awsRegion,
+		Endpoint:          kinesisEndpoint,
 		Timestamp:         timestamp,
 		Logger:            logger,
 	})
 	if err != nil {
 		stdlog.Fatal(err)
 	}
+
+	http.Handle("/metrics", promhttp.Handler())
+	go http.ListenAndServe(fmt.Sprintf(":%d", metricsPort), nil)
 
 	ctx := context.Background()
 	kc.Sub(ctx)
@@ -59,6 +92,7 @@ type KinesisConfig struct {
 	RoleArn           string
 	ShardIteratorType string
 	AWSRegion         string
+	Endpoint          string
 	Shards            []string
 	Timestamp         string
 	Logger            log.LeveledLogger
@@ -75,11 +109,18 @@ type KinesisClient struct {
 
 func NewKinesisClient(k KinesisConfig) (*KinesisClient, error) {
 	s := session.Must(session.NewSession())
-	creds := stscreds.NewCredentials(s, k.RoleArn)
+	config := &aws.Config{
+		Region:   aws.String(k.AWSRegion),
+		Endpoint: aws.String(k.Endpoint),
+	}
+
+	if k.RoleArn != "" {
+		config.Credentials = stscreds.NewCredentials(s, k.RoleArn)
+	}
 
 	kc := &KinesisClient{
 		logger:            k.Logger,
-		client:            kinesis.New(s, &aws.Config{Region: aws.String(k.AWSRegion), Credentials: creds}),
+		client:            kinesis.New(s, config),
 		streamName:        k.StreamName,
 		shards:            k.Shards,
 		shardIteratorType: k.ShardIteratorType,
@@ -98,6 +139,7 @@ func NewKinesisClient(k KinesisConfig) (*KinesisClient, error) {
 }
 
 func (k *KinesisClient) Sub(ctx context.Context) {
+	k.logger.Debug("msg", "reading from kinesis", "shards", fmt.Sprintf("%v", k.shards))
 	for _, shard := range k.shards {
 		if err := k.readShard(ctx, shard); err != nil {
 			k.logger.Error("msg", "failed to read shard", "shardID", shard, "err", err)
@@ -130,17 +172,16 @@ func (k *KinesisClient) readShard(ctx context.Context, shardID string) error {
 
 		if len(out.Records) > 0 {
 			for _, record := range out.Records {
-				fmt.Println(string(record.Data))
+				fmt.Fprint(os.Stdout, string(record.Data))
 				if record.ApproximateArrivalTimestamp != nil {
-					fmt.Println("WrittenAt: ", *record.ApproximateArrivalTimestamp)
+					writtenAt.WithLabelValues(shardID).Set(float64(record.ApproximateArrivalTimestamp.Unix()))
 				}
-				fmt.Println("")
 			}
 
 		}
 
 		if out.MillisBehindLatest != nil {
-			k.logger.Debug("MillisBehindLatest", *out.MillisBehindLatest)
+			millisBehindLatest.WithLabelValues(shardID).Set(float64(*out.MillisBehindLatest))
 		}
 
 		if out.NextShardIterator == nil {
