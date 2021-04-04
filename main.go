@@ -172,7 +172,7 @@ func (k *KinesisClient) readShard(ctx context.Context, shardID string) error {
 
 		if len(out.Records) > 0 {
 			for _, record := range out.Records {
-				fmt.Fprint(os.Stdout, string(record.Data))
+				fmt.Fprintln(os.Stdout, string(record.Data))
 				if record.ApproximateArrivalTimestamp != nil {
 					writtenAt.WithLabelValues(shardID).Set(float64(record.ApproximateArrivalTimestamp.Unix()))
 				}
