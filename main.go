@@ -7,6 +7,8 @@ import (
 	stdlog "log"
 	"net/http"
 	"os"
+	"os/signal"
+	"sync"
 	"time"
 
 	"github.com/jcox250/log"
@@ -83,7 +85,14 @@ func main() {
 	http.Handle("/metrics", promhttp.Handler())
 	go http.ListenAndServe(fmt.Sprintf(":%d", metricsPort), nil)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt)
+	go func() {
+		<-sigc
+		cancel()
+	}()
+
 	kc.Sub(ctx)
 }
 
@@ -140,11 +149,19 @@ func NewKinesisClient(k KinesisConfig) (*KinesisClient, error) {
 
 func (k *KinesisClient) Sub(ctx context.Context) {
 	k.logger.Debug("msg", "reading from kinesis", "shards", fmt.Sprintf("%v", k.shards))
+	wg := sync.WaitGroup{}
 	for _, shard := range k.shards {
-		if err := k.readShard(ctx, shard); err != nil {
-			k.logger.Error("msg", "failed to read shard", "shardID", shard, "err", err)
-		}
+		wg.Add(1)
+		go func(sid string) {
+			defer wg.Done()
+			if err := k.readShard(ctx, sid); err != nil {
+				k.logger.Error("msg", "failed to read shard", "shardID", sid, "err", err)
+			}
+		}(shard)
 	}
+
+	k.logger.Debug("msg", "waiting for readShard goroutines to finish")
+	wg.Wait()
 }
 
 func (k *KinesisClient) readShard(ctx context.Context, shardID string) error {
@@ -154,10 +171,14 @@ func (k *KinesisClient) readShard(ctx context.Context, shardID string) error {
 	}
 
 	for {
-		out, err := k.client.GetRecords(&kinesis.GetRecordsInput{
+		out, err := k.client.GetRecordsWithContext(ctx, &kinesis.GetRecordsInput{
 			ShardIterator: aws.String(iterator),
 		})
 		if err != nil {
+			if err == context.Canceled {
+				k.logger.Info("msg", "context canceled")
+				return nil
+			}
 			if aerr, ok := err.(awserr.Error); ok {
 				switch aerr.Code() {
 				// If throttled then wait and try again
